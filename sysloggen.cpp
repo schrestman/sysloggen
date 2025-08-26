@@ -10,7 +10,7 @@
 #include <unistd.h>     // For POSIX operating system API (e.g., close() for sockets)
 #include <chrono>       // For time measurements and high-resolution clock
 #include <cstdlib>      // For general utilities (e.g., atoi, atol, exit)
-#include <format>       // For C++20 string formatting (if available, otherwise use stringstream or manual concatenation)
+//#include <format>       // For C++20 string formatting (if available, otherwise use stringstream or manual concatenation)
 #include <iomanip>      // For output formatting (e.g., std::put_time, std::setw, std::setfill)
 #include <fstream>      // For file input/output operations (e.g., ifstream)
 #include <algorithm>    // For algorithms (e.g., std::shuffle, though not used in final version)
@@ -26,6 +26,8 @@ vector<string> syslogMessages;
 // Global vector to store hostnames read from a host file.
 // This allows all threads to select from a predefined list of hostnames.
 vector<string> hostnames;
+// Global vector to store source IP addresses read from a file.
+vector<string> source_ips;
 // Global random device and generator for selecting messages/hostnames.
 // Using a single global generator might have contention issues in high-concurrency
 // but for simple random access it's often acceptable. For string generation,
@@ -116,7 +118,9 @@ string getSyslogMessage() {
     // Format: <PRI>TIMESTAMP HOSTNAME TAG: MESSAGE
     // Example: <13>Jul  2 10:18:14 myhost sysloggen: This is the message.
     // Note the space padding for the day if it's a single digit (e.g., " 2" vs "12").
-    return format("<{}>{} {} {}: {}\n", pri, timestamp, current_hostname, app_tag, message_content);
+    std::ostringstream oss_msg;
+    oss_msg << "<" << pri << ">" << timestamp << " " << current_hostname << " " << app_tag << ": " << message_content << "\n";
+    return oss_msg.str();
 }
 
 // Function to send a single syslog message over a UDP socket.
@@ -137,14 +141,16 @@ void sendSyslogMessage(int sock, const sockaddr_in& addr) {
 
 // Function to print the correct usage instructions for the program.
 void printUsage(const char* progName) {
-    cerr << "Usage: " << progName << " <Destination_IP> <Port> <NumMessages> <NumThreads> [ -s <Source_IP> ] [ -f <message_file> ] [ -h <host_file> ]" << endl;
+    cerr << "Usage: " << progName << " <Destination_IP> <Port> <NumMessages> <NumThreads> [ -s <Source_IP> | -S <source_ip_file> ] [ -f <message_file> ] [ -h <host_file> ] [ -d <delay_ms> ]" << endl;
     cerr << "  <Destination_IP>: IP address of the syslog receiver." << endl;
     cerr << "  <Port>: Port number of the syslog receiver (e.g., 514)." << endl;
     cerr << "  <NumMessages>: Total number of messages to send." << endl;
     cerr << "  <NumThreads>: Number of concurrent threads to use." << endl;
     cerr << "  -s <Source_IP>: (Optional) Specifies the source IP address for the outgoing packets. If not provided, the OS determines the source IP." << endl;
+    cerr << "  -S <source_ip_file>: (Optional) Path to a file containing source IP addresses, one per line. Cannot be used with -s." << endl;
     cerr << "  -f <message_file>: (Optional) Path to a file containing messages, one per line." << endl;
     cerr << "  -h <host_file>: (Optional) Path to a file containing hostnames, one per line." << endl;
+    cerr << "  -d <delay_ms>: (Optional) Adds a delay in milliseconds between each syslog message." << endl;
     exit(EXIT_FAILURE); // Exit the program indicating an error
 }
 
@@ -163,8 +169,10 @@ int main(int argc, char* argv[]) {
     int num_threads = atoi(argv[4]);     // Number of concurrent threads
 
     string sourceIpString; // Stores the optional source IP address
+    string sourceIpFilePath; // Stores the optional path to the source IP file
     string messageFilePath; // Stores the optional path to the message file
     string hostFilePath;    // Stores the optional path to the host file
+    int delay_ms = 0;       // Stores the optional delay in milliseconds
 
     // Parse optional command-line arguments (-s, -f, -h).
     for (int i = 5; i < argc; ++i) {
@@ -175,6 +183,15 @@ int main(int argc, char* argv[]) {
                 i++; // Increment i to skip the IP address argument in the next iteration
             } else {
                 cerr << "Error: -s option requires an IP address." << endl;
+                printUsage(argv[0]);
+            }
+        } else if (string(argv[i]) == "-S") {
+            // If -S is found, the next argument should be the source IP file path.
+            if (i + 1 < argc) {
+                sourceIpFilePath = argv[i+1];
+                i++; // Increment i to skip the filename argument
+            } else {
+                cerr << "Error: -S option requires a filename." << endl;
                 printUsage(argv[0]);
             }
         } else if (string(argv[i]) == "-f") {
@@ -193,6 +210,13 @@ int main(int argc, char* argv[]) {
                 i++; // Increment i to skip the filename argument
             } else {
                 cerr << "Error: -h option requires a filename." << endl;
+                printUsage(argv[0]);
+            }
+        } else if (string(argv[i]) == "-d") {
+            if (i + 1 < argc) {
+                delay_ms = atoi(argv[++i]);
+            } else {
+                cerr << "Error: -d option requires a number in milliseconds." << endl;
                 printUsage(argv[0]);
             }
         } else {
@@ -237,6 +261,28 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Read source IPs from the specified file if sourceIpFilePath is not empty.
+    if (!sourceIpFilePath.empty()) {
+        if (!sourceIpString.empty()) {
+            cerr << "Error: -s and -S options cannot be used together." << endl;
+            printUsage(argv[0]);
+        }
+        ifstream sourceIpFile(sourceIpFilePath); // Open the source IP file for reading
+        if (!sourceIpFile.is_open()) {
+            cerr << "Error: Could not open source IP file: " << sourceIpFilePath << endl;
+            return EXIT_FAILURE; // Exit if file cannot be opened
+        }
+        string line;
+        while (getline(sourceIpFile, line)) { // Read line by line
+            source_ips.push_back(line); // Add each line as a source IP
+        }
+        sourceIpFile.close(); // Close the file
+
+        if (source_ips.empty()) {
+            cerr << "Warning: Source IP file is empty. Will use OS-assigned source IP." << endl;
+        }
+    }
+
     // Record the start time for performance measurement.
     auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -252,54 +298,61 @@ int main(int argc, char* argv[]) {
 
         // Emplace a new thread into the vector.
         // The lambda function defines the work each thread will do.
-        threads.emplace_back([dest_ip, dest_port, num_messages_for_thread, sourceIpString]() {
-            // Create a UDP socket for sending messages.
-            int sock = socket(AF_INET, SOCK_DGRAM, 0);
-            if (sock == -1) {
-                cerr << "Error: Could not create socket in thread." << endl;
-                return; // Exit the thread if socket creation fails
-            }
-
-            // If a source IP is provided, bind the socket to it.
-            // This allows controlling the source IP of the outgoing UDP packets.
-            if (!sourceIpString.empty()) {
-                sockaddr_in local_addr;
-                memset(&local_addr, 0, sizeof(local_addr)); // Clear the structure
-                local_addr.sin_family = AF_INET; // IPv4
-                // Convert source IP string to binary form.
-                if (inet_pton(AF_INET, sourceIpString.c_str(), &local_addr.sin_addr) <= 0) {
-                    cerr << "Error: Invalid source IP address: " << sourceIpString << endl;
-                    close(sock); // Close the socket before exiting
-                    return;
-                }
-                local_addr.sin_port = htons(0); // Use ephemeral port (OS assigns a free port)
-
-                // Bind the socket to the specified source IP address.
-                if (bind(sock, (sockaddr*)&local_addr, sizeof(local_addr)) == -1) {
-                    cerr << "Error: Could not bind socket to source IP " << sourceIpString << ": " << strerror(errno) << endl;
-                    close(sock); // Close the socket before exiting
-                    return;
-                }
-            }
-
-            // Set up the destination address structure.
+        threads.emplace_back([dest_ip, dest_port, num_messages_for_thread, sourceIpString, delay_ms]() {
+            // Set up the destination address structure once.
             sockaddr_in dest_addr;
-            memset(&dest_addr, 0, sizeof(dest_addr)); // Clear the structure
-            dest_addr.sin_family = AF_INET;           // IPv4
-            // Convert destination IP string to binary form.
+            memset(&dest_addr, 0, sizeof(dest_addr));
+            dest_addr.sin_family = AF_INET;
             if (inet_pton(AF_INET, dest_ip, &dest_addr.sin_addr) <= 0) {
                 cerr << "Error: Invalid destination IP address: " << dest_ip << endl;
-                close(sock); // Close the socket before exiting
                 return;
             }
-            dest_addr.sin_port = htons(dest_port); // Convert port to network byte order
+            dest_addr.sin_port = htons(dest_port);
 
             // Loop to send the assigned number of messages for this thread.
             for (int j = 0; j < num_messages_for_thread; ++j) {
-                sendSyslogMessage(sock, dest_addr); // Call the function to send a single message
-            }
+                int sock = socket(AF_INET, SOCK_DGRAM, 0);
+                if (sock == -1) {
+                    cerr << "Error: Could not create socket in thread." << endl;
+                    continue; // Skip this message
+                }
 
-            close(sock); // Close the socket when the thread finishes its work
+                string currentSourceIp = sourceIpString;
+                if (!source_ips.empty()) {
+                    uniform_int_distribution<> distrib_ip(0, source_ips.size() - 1);
+                    currentSourceIp = source_ips[distrib_ip(gen)];
+                }
+
+                if (!currentSourceIp.empty()) {
+                    sockaddr_in local_addr;
+                    memset(&local_addr, 0, sizeof(local_addr));
+                    local_addr.sin_family = AF_INET;
+                    if (inet_pton(AF_INET, currentSourceIp.c_str(), &local_addr.sin_addr) <= 0) {
+                        cerr << "Error: Invalid source IP address: " << currentSourceIp << endl;
+                        close(sock);
+                        continue; // Skip this message
+                    }
+                    local_addr.sin_port = htons(0);
+
+                    int freebind = 1;
+                    if (setsockopt(sock, IPPROTO_IP, IP_FREEBIND, &freebind, sizeof(freebind)) == -1) {
+                        cerr << "Warning: Could not set IP_FREEBIND socket option: " << strerror(errno) << endl;
+                        // Continue anyway, as this might not be a fatal error depending on the system configuration.
+                    }
+
+                    if (bind(sock, (sockaddr*)&local_addr, sizeof(local_addr)) == -1) {
+                        cerr << "Error: Could not bind socket to source IP " << currentSourceIp << ": " << strerror(errno) << endl;
+                        close(sock);
+                        continue; // Skip this message
+                    }
+                }
+
+                sendSyslogMessage(sock, dest_addr);
+                if (delay_ms > 0) {
+                    this_thread::sleep_for(chrono::milliseconds(delay_ms));
+                }
+                close(sock);
+            }
         });
     }
 
@@ -327,3 +380,4 @@ int main(int argc, char* argv[]) {
 
     return 0; // Indicate successful execution
 }
+
